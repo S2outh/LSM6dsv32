@@ -6,6 +6,7 @@ version = 4
 name = "LSM6DSV32"
 version = "0.1.0"
 dependencies = [
+ "bitflags 2.10.0",
  "cortex-m",
  "cortex-m-rt",
  "critical-section",
