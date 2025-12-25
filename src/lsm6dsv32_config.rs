@@ -1,7 +1,68 @@
 #![no_std]
 #![no_main]
 
-pub struct ImuConfig {
+use core::str;
+
+#[macro_export]
+macro_rules! create_state_marker {
+    (
+        $($name:ident),*
+    ) => {
+        $(
+            #[derive(Clone, Debug, Default, Copy)]
+            pub struct $name;
+        )*
+    };
+}
+
+create_state_marker!(
+    FifoDisabled,
+    FifoEnabled,
+    Int1Disabled,
+    Int1Enabled,
+    Int2Disabled,
+    Int2Enabled
+);
+
+#[allow(non_camel_case_types)]
+#[repr(u8)]
+pub enum Register {
+    PIN_CTRL = 0x02,
+    IF_CTRL = 0x03,
+    FIFO_CTRL1 = 0x07,
+    FIFO_CTRL3 = 0x09,
+    FIFO_CTRL4 = 0x0A,
+    COUNTER_BDR_REG1 = 0x0B,
+    COUNTER_BDR_REG2 = 0x0C,
+    INT1_CTRL = 0x0D,
+    INT2_CTRL = 0x0E,
+    WHO_AM_I = 0x0F,
+    CTRL1 = 0x10,
+    CTRL2 = 0x11,
+    CTRL4 = 0x13,
+    CTRL6 = 0x15,
+    CTRL7 = 0x16,
+    CTRL8 = 0x17,
+    CTRL9 = 0x18,
+    STATUS_REG = 0x1E,
+    OUT_TEMP_L = 0x20,
+    OUTX_L_G = 0x22,
+    OUTX_L_A = 0x28,
+    UI_OUTX_L_G_OIS_EIS = 0x2E,
+    UI_OUTX_L_A_OIS_DUAL_C = 0x34,
+    TIMESTAMP0 = 0x40,
+    FUNCTIONS_ENABLE = 0x50,
+    MD1_CFG = 0x5E,
+    MD2_CFG = 0x5F,
+    FIFO_DATA_OUT_TAG = 0x78,
+    FIFO_DATA_OUT_X_L = 0x79,
+}
+
+
+
+
+#[derive(Clone, Debug)]
+pub struct ImuConfigRaw {
     pub general: GenerelConfig,
     pub accel: AccelConfig,
     pub gyro: GyroConfig,
@@ -10,14 +71,28 @@ pub struct ImuConfig {
     pub int2: Interrupt2Config,
 }
 
+#[derive(Clone, Debug)]
+pub struct ImuConfig<Fifo, Int1, Int2> {
+    pub fifo_state: Fifo,
+    pub int1_state: Int1,
+    pub int2_state: Int2,
+    pub general: GenerelConfig,
+    pub accel: AccelConfig,
+    pub gyro: GyroConfig,
+    pub fifo: FifoConfig,
+    pub int1: Interrupt1Config,
+    pub int2: Interrupt2Config,
+}
+#[derive(Clone, Debug, Copy)]
 pub struct GenerelConfig {
     pub sda_pull_up: bool,
     pub sdo_pull_up: bool,
     pub anti_spike_filter: bool,
     pub interrupt_lvl: bool,
     pub interrupt_pin_mode: bool,
+    pub timestamp_enabled: bool,
 }
-
+#[derive(Clone, Debug, Copy)]
 pub struct GyroConfig {
     pub enabled: bool,
     pub mode: GyroOperatingMode,
@@ -26,7 +101,7 @@ pub struct GyroConfig {
     pub lpf1: GyroLpf1,
     pub full_scale: GyroFS,
 }
-
+#[derive(Clone, Debug, Copy)]
 pub struct AccelConfig {
     pub enabled: bool,
     pub mode: AccelOperatingMode,
@@ -41,7 +116,7 @@ pub struct AccelConfig {
     pub user_offset: [i8; 3],
     pub dual_channel: bool,
 }
-
+#[derive(Clone, Debug, Copy)]
 pub struct FifoConfig {
     pub mode: FIFOMode,
     pub watermark_threshold: u8,
@@ -52,7 +127,7 @@ pub struct FifoConfig {
     pub temp_fifo: TempatureBatchRate,
     pub ts_fifo: TimeStampBatch,
 }
-
+#[derive(Clone, Debug, Copy)]
 pub struct Interrupt1Config {
     pub counter_bdr_int: bool,
     pub fifo_full_int: bool,
@@ -61,7 +136,7 @@ pub struct Interrupt1Config {
     pub data_ready_gyro: bool,
     pub data_ready_accel: bool,
 }
-
+#[derive(Clone, Debug, Copy)]
 pub struct Interrupt2Config {
     pub counter_bdr_int: bool,
     pub fifo_full_int: bool,
@@ -266,22 +341,26 @@ pub enum TriggerCounter {
     Gyro = 0b01,
 }
 
-impl Default for ImuConfig {
+impl Default for ImuConfig<FifoDisabled, Int1Disabled, Int2Disabled> {
     fn default() -> Self {
         Self {
+            fifo_state: FifoDisabled,
+            int1_state: Int1Disabled,
+            int2_state: Int2Disabled,
             general: GenerelConfig {
                 sda_pull_up: false,
                 sdo_pull_up: false,
                 anti_spike_filter: false,
                 interrupt_lvl: false,
                 interrupt_pin_mode: false,
+                timestamp_enabled: true,
             },
             accel: AccelConfig {
                 enabled: true,
                 mode: AccelOperatingMode::HighPerformance,
-                odr: AccelODR::Hz960,
+                odr: AccelODR::Hz7_5,
                 lp_hp_f2: AccelFilterBW::OdrDiv4,
-                full_scale: AccelFS::G4,
+                full_scale: AccelFS::G8,
                 lp_hp: false,
                 lpf2_enabled: false,
                 hp_reference_mode: false,
@@ -293,7 +372,7 @@ impl Default for ImuConfig {
             gyro: GyroConfig {
                 enabled: true,
                 mode: GyroOperatingMode::HighPerformance,
-                odr: GyroODR::Hz960,
+                odr: GyroODR::Hz7_5,
                 lpf1_enabled: false,
                 lpf1: GyroLpf1::ExtraWide,
                 full_scale: GyroFS::DPS125,
@@ -325,6 +404,19 @@ impl Default for ImuConfig {
                 data_ready_accel: false,
                 temp_ready: false,
             },
+        }
+    }
+}
+
+impl<Fi, I1, I2> ImuConfig<Fi, I1, I2> {
+    pub fn build(&self) -> ImuConfigRaw {
+        ImuConfigRaw {
+            general: self.general,
+            accel: self.accel,
+            gyro: self.gyro,
+            fifo: self.fifo,
+            int1: self.int1,
+            int2: self.int2,
         }
     }
 }

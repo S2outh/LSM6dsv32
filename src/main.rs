@@ -1,16 +1,16 @@
 #![no_std]
 #![no_main]
 
-use LSM6DSV32::lsm6dsv32::Lsm6dsv32;
+use LSM6DSV32::lsm6dsv32::*;
 use defmt::*;
 use defmt_rtt as _;
 use embassy_time::Timer;
 use heapless::String;
 use panic_probe as _;
-
+use LSM6DSV32::lsm6dsv32_config::*;
 use embassy_executor::{Spawner, task};
 use embassy_stm32::{
-    bind_interrupts, exti::ExtiInput, gpio::{Level, Output, Speed}, interrupt, mode::Async, pac::usb::vals::Stat, spi::{Config, Instance, Mode, Phase, Polarity, Spi}, time::Hertz, usart::{self, Config as UartConfig, Uart}
+    bind_interrupts, exti::ExtiInput, gpio::{Level, Output, Pull, Speed}, interrupt, mode::Async, pac::usb::vals::Stat, spi::{Config, Instance, Mode, Phase, Polarity, Spi}, time::Hertz, usart::{self, Config as UartConfig, Uart}
 };
 
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, mutex::Mutex};
@@ -47,7 +47,33 @@ async fn main(spawner: Spawner) {
     
     let cs = CS.init(Output::new(p.PB0, Level::High, Speed::High));
 
-    let lsm = Lsm6dsv32::new(spi, cs, int1, int2);
+    let int1 = INT1.init(ExtiInput::new(
+        p.PB1, 
+        p.EXTI1, 
+        Pull::Down));
+    
+    let int2 = INT2.init(ExtiInput::new(
+        p.PB2,
+        p.EXTI2,
+        Pull::Down));
 
+    let lsm = Lsm6dsv32::new(spi, cs, int1, int2, true).await;
+    let mut lsm = lsm.enable_fifo();
+    loop {
+        match lsm.read_timestamp().await {
+            Ok(temp) => {
+                info!("Timestamp: {}", temp);
+                if temp > 15000.0 {
+                    lsm.reset_timer().await;
+                }
+            }
+            Err(e) => {
+                error!("IMU Fehler: {:?}", e);
+            }
+        }
+        Timer::after_millis(250).await;
+    }
+    
+    //lsm.enable_debug(true);
 
 }
