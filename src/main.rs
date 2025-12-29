@@ -12,8 +12,6 @@ use embassy_executor::{Spawner, task};
 use embassy_stm32::{
     bind_interrupts, exti::ExtiInput, gpio::{Level, Output, Pull, Speed}, interrupt, mode::Async, pac::usb::vals::Stat, spi::{Config, Instance, Mode, Phase, Polarity, Spi}, time::Hertz, usart::{self, Config as UartConfig, Uart}
 };
-
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, mutex::Mutex};
 use static_cell::StaticCell;
 
 type SpiError = embassy_stm32::spi::Error;
@@ -57,23 +55,44 @@ async fn main(spawner: Spawner) {
         p.EXTI2,
         Pull::Down));
 
-    let lsm = Lsm6dsv32::new(spi, cs, int1, int2, true).await;
+    let mut lsm = Lsm6dsv32::new(spi, cs, int1, int2, false).await;
     let mut lsm = lsm.enable_fifo();
-    loop {
-        match lsm.read_timestamp().await {
-            Ok(temp) => {
-                info!("Timestamp: {}", temp);
-                if temp > 15000.0 {
-                    lsm.reset_timer().await;
-                }
-            }
-            Err(e) => {
-                error!("IMU Fehler: {:?}", e);
-            }
-        }
-        Timer::after_millis(250).await;
-    }
+    lsm.config_fifo(FIFOMode::ContinuousMode, GyroBatchDataRate::NotBatched, AccelBatchDataRate::Hz1_875, TempatureBatchRate::NotBatched, TimeStampBatch::Every32);
+    lsm.set_counter(TriggerCounter::Gyro,16);
+    lsm.commit_config().await;
     
+    let scale = lsm.calc_scaling(UnitScale::Default);
+   
+    loop {
+        if let Err(e) = lsm.read_data_when_ready_polling(true, false, false, true, 10, LogicOp::OR, |s_raw| {
+            let s = s_raw.create_f32(scale);
+            info!("IMU DATA -> Accel: {:?}, Accel2: {:?} Gyro: {:?}, TS: {}, deltaTS: {}", s.accel, s.accel_ch2,s.gyro, s.last_ts, s.delta_ts);
+        }).await {
+            error!("Fehler");
+        }
+        /* 
+        let status = lsm.read_fifo_status().await.unwrap_or_else(|e|{error!("Fehler beim Lesen {:?}",e); FifoStatusSample::from_registers(0,   0)});
+        info!("{}",status.unread_samples)
+        
+        let result = lsm.read_timestamp().await.unwrap_or_else(|e|{error!("Fehler beim Lesen {:?}",e); 0});
+        info!("{}",result);
+        Timer::after_millis(500).await;
+         
+        lsm.fifo_read_data_polling(FifoTrigger::Counter, 10, false,
+            |se| {
+                
+            let s = se.create_f32(scale);
+            //info!("IMU DATA -> Accel: {:?}, Accel2: {:?} Gyro: {:?}, TS: {}, deltaTS: {}", s.accel, s.accel_ch2,s.gyro, s.last_ts, s.delta_ts);
+            },
+            Some(|t| {
+            info!("TEMP UPDATE -> {} °C", temp_f32(t));
+            })
+        ).await.unwrap_or_else(|e| error!("FIFO Error: {:?}", e));   
+       */
+
+        
+
+    }
     //lsm.enable_debug(true);
 
 }

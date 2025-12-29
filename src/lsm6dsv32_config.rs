@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use core::str;
+use core::{cmp::max, str};
 
 #[macro_export]
 macro_rules! create_state_marker {
@@ -44,6 +44,8 @@ pub enum Register {
     CTRL7 = 0x16,
     CTRL8 = 0x17,
     CTRL9 = 0x18,
+    FIFO_STATUS1 = 0x1B,
+    FIFO_STATUS2 = 0x1C,
     STATUS_REG = 0x1E,
     OUT_TEMP_L = 0x20,
     OUTX_L_G = 0x22,
@@ -54,12 +56,10 @@ pub enum Register {
     FUNCTIONS_ENABLE = 0x50,
     MD1_CFG = 0x5E,
     MD2_CFG = 0x5F,
+    EMB_FUNC_CFG = 0x63,
     FIFO_DATA_OUT_TAG = 0x78,
     FIFO_DATA_OUT_X_L = 0x79,
 }
-
-
-
 
 #[derive(Clone, Debug)]
 pub struct ImuConfigRaw {
@@ -126,6 +126,7 @@ pub struct FifoConfig {
     pub accel_fifo: AccelBatchDataRate,
     pub temp_fifo: TempatureBatchRate,
     pub ts_fifo: TimeStampBatch,
+    pub batch_dual: bool,
 }
 #[derive(Clone, Debug, Copy)]
 pub struct Interrupt1Config {
@@ -147,30 +148,56 @@ pub struct Interrupt2Config {
     pub temp_ready: bool,
 }
 impl AccelConfig {
-    pub fn calc_scaling_factor(&self) -> f32 {
+    pub fn calc_scaling_factor(&self, unit_scale: UnitScale) -> f32 {
+        let fs_g = match self.full_scale {
+            AccelFS::G4 => 4.0,
+            AccelFS::G8 => 8.0,
+            AccelFS::G16 => 16.0,
+            AccelFS::G32 => 32.0,
+        };
+
+        (fs_g * unit_scale.as_f32()) / 32768.0
+    }
+
+    pub fn get_fs(&self) -> i32 {
         match self.full_scale {
-            AccelFS::G4 => 4.0 / 32768.0,
-            AccelFS::G8 => 8.0 / 32768.0,
-            AccelFS::G16 => 16.0 / 32768.0,
-            AccelFS::G32 => 32.0 / 32768.0,
+            AccelFS::G4 => 4,
+            AccelFS::G8 => 8,
+            AccelFS::G16 => 16,
+            AccelFS::G32 => 32,
         }
     }
 }
 
 impl GyroConfig {
-    pub fn calc_scaling_factor(&self) -> f32 {
-        match self.full_scale {
-            GyroFS::DPS125 => 125.0 / 32768.0,
-            GyroFS::DPS250 => 250.0 / 32768.0,
-            GyroFS::DPS500 => 500.0 / 32768.0,
-            GyroFS::DPS1000 => 1000.0 / 32768.0,
-            GyroFS::DPS2000 => 2000.0 / 32768.0,
-            GyroFS::DPS4000 => 4000.0 / 32768.0,
-        }
+    pub fn calc_scaling_factor(&self, unit_scale: UnitScale) -> f32 {
+        let fs_value: f32 = match self.full_scale {
+            GyroFS::DPS125 => 125.0,
+            GyroFS::DPS250 => 250.0,
+            GyroFS::DPS500 => 500.0,
+            GyroFS::DPS1000 => 1000.0,
+            GyroFS::DPS2000 => 2000.0,
+            GyroFS::DPS4000 => 4000.0,
+        };
+
+        (fs_value * unit_scale.as_f32()) / 32768.0
+    }
+}
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+#[repr(u32)]
+pub enum UnitScale {
+    Micro = 1_000_000,
+    Milli = 1_000,
+    Default = 1,
+}
+
+impl UnitScale {
+    pub fn as_f32(&self) -> f32 {
+        *self as u32 as f32
     }
 }
 // Gyro Output-Data-Rate
-#[derive(Copy, Clone, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum GyroODR {
     PowerDown = 0b0000,
@@ -186,7 +213,8 @@ pub enum GyroODR {
     KHz3_84 = 0b1011,
     KHz7_68 = 0b1100,
 }
-#[derive(Copy, Clone, Debug)]
+
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum GyroLpf1 {
     ExtraWide = 0b000,
@@ -198,7 +226,7 @@ pub enum GyroLpf1 {
     VeryNarrow = 0b110,
     UltraNarrow = 0b111,
 }
-#[derive(Copy, Clone, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum GyroFS {
     DPS125 = 0b0000,
@@ -209,7 +237,7 @@ pub enum GyroFS {
     DPS4000 = 0b1100,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum GyroOperatingMode {
     HighPerformance,
@@ -219,7 +247,7 @@ pub enum GyroOperatingMode {
 }
 
 // Rate at which gyro data fills the FIFO
-#[derive(Copy, Clone, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum GyroBatchDataRate {
     NotBatched = 0b0000,
@@ -235,8 +263,27 @@ pub enum GyroBatchDataRate {
     KHz3_84 = 0b1011,
     KHz7_68 = 0b1100,
 }
+
+impl GyroBatchDataRate {
+    pub fn to_hz(&self) -> f32 {
+        match self {
+            Self::NotBatched => 0.0,
+            Self::Hz7_5 => 7.5,
+            Self::Hz15 => 15.0,
+            Self::Hz30 => 30.0,
+            Self::Hz60 => 60.0,
+            Self::Hz120 => 120.0,
+            Self::Hz240 => 240.0,
+            Self::Hz480 => 480.0,
+            Self::Hz960 => 960.0,
+            Self::KHz1_92 => 1920.0,
+            Self::KHz3_84 => 3840.0,
+            Self::KHz7_68 => 7680.0,
+        }
+    }
+}
 // Accel Output-Data-Rate
-#[derive(Copy, Clone, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum AccelODR {
     PowerDown = 0b0000,
@@ -253,7 +300,8 @@ pub enum AccelODR {
     KHz3_84 = 0b1011,
     KHz7_68 = 0b1100,
 }
-#[derive(Copy, Clone, Debug)]
+
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum AccelFilterBW {
     OdrDiv4 = 0b000,
@@ -265,7 +313,7 @@ pub enum AccelFilterBW {
     OdrDiv400 = 0b110,
     OdrDiv800 = 0b111,
 }
-#[derive(Copy, Clone, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum AccelFS {
     G4 = 0b00,
@@ -273,7 +321,7 @@ pub enum AccelFS {
     G16 = 0b10,
     G32 = 0b11,
 }
-#[derive(Copy, Clone, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum AccelOperatingMode {
     HighPerformance = 0b000,
@@ -286,7 +334,7 @@ pub enum AccelOperatingMode {
     Normal = 0b111,
 }
 // Rate at which accel data fills the FIFO
-#[derive(Copy, Clone, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum AccelBatchDataRate {
     NotBatched = 0b0000,
@@ -304,8 +352,28 @@ pub enum AccelBatchDataRate {
     KHz7_68 = 0b1100,
 }
 
+impl AccelBatchDataRate {
+    pub fn to_hz(&self) -> f32 {
+        match self {
+            Self::NotBatched => 0.0,
+            Self::Hz1_875 => 1.875,
+            Self::Hz7_5 => 7.5,
+            Self::Hz15 => 15.0,
+            Self::Hz30 => 30.0,
+            Self::Hz60 => 60.0,
+            Self::Hz120 => 120.0,
+            Self::Hz240 => 240.0,
+            Self::Hz480 => 480.0,
+            Self::Hz960 => 960.0,
+            Self::KHz1_92 => 1920.0,
+            Self::KHz3_84 => 3840.0,
+            Self::KHz7_68 => 7680.0,
+        }
+    }
+}
+
 // Configures decimation for timestamp batching in FIFO to control the write rate relative to the maximum sensor data rate
-#[derive(Copy, Clone, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum TimeStampBatch {
     NotBatched = 0b00,
@@ -315,7 +383,7 @@ pub enum TimeStampBatch {
 }
 
 // Rate at which temp data fills the FIFO
-#[derive(Copy, Clone, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum TempatureBatchRate {
     NotBatched = 0b00,
@@ -323,7 +391,7 @@ pub enum TempatureBatchRate {
     Hz15 = 0b10,
     Hz60 = 0b11,
 }
-#[derive(Copy, Clone, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum FIFOMode {
     Bypass = 0b000,                 // FIFO disabled
@@ -334,11 +402,224 @@ pub enum FIFOMode {
     ContinuousMode = 0b110,         // new samples overwrite the oldest once the fifo is full
     BypassToFifoMode = 0b111,       // Fifo disabled until trigger, then fills once and stops
 }
-#[derive(Copy, Clone, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum TriggerCounter {
     Accel = 0b00,
     Gyro = 0b01,
+}
+
+pub struct StatusRegSample {
+    pub accel_data_ready: bool,
+    pub gyro_data_ready: bool,
+    pub temp_data_ready: bool,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+
+pub struct FifoStatusSample {
+    pub unread_samples: u16,
+    pub watermark_reached: bool,
+    pub overrun: bool,
+    pub full: bool,
+    pub counter_reached: bool,
+    pub latched_overrun: bool,
+}
+impl FifoStatusSample {
+    pub fn from_registers(status1: u8, status2: u8) -> Self {
+        let unread = ((status2 as u16 & 0x01) << 8) | (status1 as u16);
+
+        Self {
+            unread_samples: unread,
+            // Bit 7: FIFO_WTM_IA
+            watermark_reached: (status2 & 0x80) != 0,
+            // Bit 6: FIFO_OVR_IA
+            overrun: (status2 & 0x40) != 0,
+            // Bit 5: FIFO_FULL_IA
+            full: (status2 & 0x20) != 0,
+            // Bit 4: COUNTER_BDR_IA
+            counter_reached: (status2 & 0x10) != 0,
+            // Bit 3: FIFO_OVR_LATCHED
+            latched_overrun: (status2 & 0x08) != 0,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ImuSample_f32 {
+    pub accel: [f32; 3],
+    pub accel_ch2: [f32; 3],
+    pub gyro: [f32; 3],
+    pub temp: f32,
+    pub last_ts: u64,
+    pub delta_ts: u64,
+}
+
+impl Default for ImuSample_f32 {
+    fn default() -> Self {
+        Self {
+            accel: [0f32; 3],
+            accel_ch2: [0f32; 3],
+            gyro: [0f32; 3],
+            temp: 0f32,
+            last_ts: 0,
+            delta_ts: 0,
+        }
+    }
+}
+
+pub struct ImuSample {
+    pub accel: [i16; 3],
+    pub accel_ch2: [i16; 3],
+    pub gyro: [i16; 3],
+    pub temp: i16,
+    pub last_ts: u64,
+    pub delta_ts: u64,
+}
+
+impl Default for ImuSample {
+    fn default() -> Self {
+        Self {
+            accel: [0; 3],
+            accel_ch2: [0; 3],
+            gyro: [0; 3],
+            temp: 0,
+            last_ts: 0,
+            delta_ts: 0,
+        }
+    }
+}
+
+impl ImuSample {
+    pub fn create_f32(&self, scale: [f32; 3]) -> ImuSample_f32 {
+        ImuSample_f32 {
+            accel: self.accel.map(|val| val as f32 * scale[0]),
+            accel_ch2: self.accel_ch2.map(|val| val as f32 * scale[2]),
+            gyro: self.gyro.map(|val| val as f32 * scale[1]),
+            temp: (self.temp as f32 / 256.0) + 25.0,
+            last_ts: self.last_ts,
+            delta_ts: self.delta_ts,
+        }
+    }
+}
+
+pub struct Sampler {
+    accel: Option<[i16; 3]>,
+    accel_ch2: Option<[i16; 3]>,
+    gyro: Option<[i16; 3]>,
+    last_ts: u64,
+
+    current_ts: bool,
+    need_ch2: bool,
+    max_a_g: bool,
+
+    sample_intervall: u64,
+    delta_ts: u64,
+    cnt_a: u8,
+    cnt_g: u8,
+}
+
+impl Sampler {
+    pub fn new(
+        dual: bool,
+        last_ts: u64,
+        bdr_accel: AccelBatchDataRate,
+        bdr_gyro: GyroBatchDataRate,
+    ) -> Self {
+        let max_bdr = bdr_accel.to_hz().max(bdr_gyro.to_hz());
+        let who_max = if max_bdr == bdr_accel.to_hz() {
+            true
+        } else {
+            false
+        };
+        Self {
+            accel: None,
+            accel_ch2: None,
+            gyro: None,
+            last_ts: last_ts,
+            need_ch2: dual,
+            current_ts: false,
+            cnt_a: 5,
+            cnt_g: 5,
+            sample_intervall: (10e9 as f32 / max_bdr) as u64,
+            delta_ts: 0,
+            max_a_g: who_max,
+        }
+    }
+    pub fn set_accel(&mut self, data: [i16; 3], cnt: u8) {
+        self.accel = Some(data);
+        self.cnt_a = cnt;
+        if self.max_a_g && !self.current_ts {
+            self.delta_ts += self.sample_intervall;
+        }
+    }
+    pub fn set_accel_ch2(&mut self, data: [i16; 3]) {
+        self.accel_ch2 = Some(data);
+    }
+    pub fn set_gyro(&mut self, data: [i16; 3], cnt: u8) {
+        self.gyro = Some(data);
+        self.cnt_g = cnt;
+        if !self.max_a_g && !self.current_ts {
+            self.delta_ts += self.sample_intervall;
+        }
+    }
+    pub fn set_last_ts(&mut self, data: u64) {
+        self.last_ts = data;
+        self.delta_ts = 0;
+        self.current_ts = true;
+    }
+    pub fn complete_sample(&mut self) -> Option<ImuSample> {
+        if self.cnt_a != self.cnt_g {
+            return None;
+        }
+
+        let accel = self.accel.take()?;
+        let gyro = self.gyro.take()?;
+
+        let accel_ch2 = if self.need_ch2 {
+            self.accel_ch2.take()?
+        } else {
+            [0i16; 3]
+        };
+        self.current_ts = false;
+        Some(ImuSample {
+            accel,
+            accel_ch2,
+            gyro,
+            temp: 0,
+            last_ts: self.last_ts,
+            delta_ts: self.delta_ts,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+pub struct FifoTag {
+    pub tag_counter: u8,
+    pub tag_sensor: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+pub struct ReadySRC {
+    pub gyro: bool,
+    pub accel: bool,
+    pub temp: bool,
+}
+
+impl ReadySRC {
+    pub fn any(&self) -> bool {
+        self.gyro || self.accel || self.temp
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogicOp {
+    AND,
+    OR,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+pub enum FifoTrigger {
+    Watermark,
+    Counter,
+    Full,
 }
 
 impl Default for ImuConfig<FifoDisabled, Int1Disabled, Int2Disabled> {
@@ -358,7 +639,7 @@ impl Default for ImuConfig<FifoDisabled, Int1Disabled, Int2Disabled> {
             accel: AccelConfig {
                 enabled: true,
                 mode: AccelOperatingMode::HighPerformance,
-                odr: AccelODR::Hz7_5,
+                odr: AccelODR::Hz1_875,
                 lp_hp_f2: AccelFilterBW::OdrDiv4,
                 full_scale: AccelFS::G8,
                 lp_hp: false,
@@ -367,12 +648,12 @@ impl Default for ImuConfig<FifoDisabled, Int1Disabled, Int2Disabled> {
                 user_offset_en: false,
                 user_offset_weight: false,
                 user_offset: [0; 3],
-                dual_channel: false,
+                dual_channel: true,
             },
             gyro: GyroConfig {
                 enabled: true,
                 mode: GyroOperatingMode::HighPerformance,
-                odr: GyroODR::Hz7_5,
+                odr: GyroODR::PowerDown,
                 lpf1_enabled: false,
                 lpf1: GyroLpf1::ExtraWide,
                 full_scale: GyroFS::DPS125,
@@ -386,6 +667,7 @@ impl Default for ImuConfig<FifoDisabled, Int1Disabled, Int2Disabled> {
                 accel_fifo: AccelBatchDataRate::NotBatched,
                 temp_fifo: TempatureBatchRate::NotBatched,
                 ts_fifo: TimeStampBatch::NotBatched,
+                batch_dual: false,
             },
             int1: Interrupt1Config {
                 counter_bdr_int: false,
