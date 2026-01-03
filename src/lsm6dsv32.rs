@@ -1,30 +1,26 @@
 #![no_std]
 #![no_main]
 
-use core::{error, pin};
+
 
 pub use crate::lsm6dsv32_config::*;
 
-use cortex_m::delay;
 use defmt::*;
 use defmt_rtt as _;
 use embassy_stm32::{
-    can::config,
     exti::ExtiInput,
-    gpio::{Level, Output, Speed},
+    gpio::{Output},
     mode::Async,
-    spi::{Config, Instance, Mode, Phase, Polarity, Spi},
-    time::Hertz,
+    spi::Spi,
 };
 use embassy_time::Timer;
-use heapless::String;
 use panic_probe as _;
-
-type SpiError = embassy_stm32::spi::Error;
 
 pub const EXPECTED_WHO_AM_I: u8 = 0x70;
 pub const G32_SCALE_FACTOR: f32 = 32.0 / 32768.0;
 
+
+// encodes bitfields into a 8Bit register
 #[macro_export]
 macro_rules! encode_reg8 {
     (base: $base:expr, { $($val:expr => $shift:literal, $width:literal),* $(,)? }) => {
@@ -44,20 +40,8 @@ macro_rules! encode_reg8 {
     };
 }
 
-macro_rules! create_const {
-    ($name:ident, $value:expr) => {
-        pub const $name: f32 = $value;
-    };
-}
-
-#[derive(defmt::Format)]
-pub enum Error {
-    Spi(SpiError),
-    NoValue,
-    WrongWhoAmI(u8),
-    WrongConfig,
-}
-
+// ======================================================
+// Converts raw sensor data to f32 physical units using desired scaling factor
 pub fn temp_f32(raw: i16) -> f32 {
     (raw as f32 / 256.0) + 25.0
 }
@@ -95,6 +79,7 @@ pub fn gyro_f32(scale: f32, raw: [i16; 3]) -> [f32; 3] {
     ]
 }
 
+/// Hardware layer containing peripherals and calibration offset
 pub struct lsm6dsv32_hw<'d> {
     spi: &'d mut Spi<'d, Async>,
     cs: &'d mut Output<'d>,
@@ -107,9 +92,10 @@ pub struct lsm6dsv32_hw<'d> {
     ts_offset: u32,
 }
 
+/// Driver-Object, managing device state, configuration and hardware acces
 pub struct Lsm6dsv32<'d, F, I1, I2> {
     hw: lsm6dsv32_hw<'d>,
-    config: ImuConfig<F, I1, I2>,
+    pub config: ImuConfig<F, I1, I2>,
 }
 
 impl<'d> Lsm6dsv32<'d, FifoDisabled, Int1Disabled, Int2Disabled> {
@@ -346,6 +332,15 @@ impl<'d, L, I1, I2> Lsm6dsv32<'d, L, I1, I2> {
         self.write_register(Register::EMB_FUNC_CFG as u8, fc)
             .await?;
 
+        if imu_config.high_accuracy_mode.is_some() {
+            let haodr_cfg = encode_reg8!({
+                imu_config.high_accuracy_mode.unwrap() as u8 => 0,2
+            });
+            log_reg!("HAODR_CONFIG", haodr_cfg);
+            self.write_register(Register::HAODR_CFG as u8, haodr_cfg)
+                .await?;
+        }
+
         Ok(())
     }
 
@@ -476,12 +471,12 @@ impl<'d, L, I1, I2> Lsm6dsv32<'d, L, I1, I2> {
         Ok(u32::from_le_bytes(data))
     }
 
-    async fn read_status_reg(&mut self) -> Result<StatusRegSample, Error> {
+    async fn read_status_reg(&mut self) -> Result<ReadySRC, Error> {
         let status = self.read_register(Register::STATUS_REG as u8).await?;
-        Ok(StatusRegSample {
-            accel_data_ready: (status & 0b0000_0001) != 0,
-            gyro_data_ready: (status & 0b0000_0010) != 0,
-            temp_data_ready: (status & 0b0000_0100) != 0,
+        Ok(ReadySRC {
+            accel: (status & 0b0000_0001) != 0,
+            gyro: (status & 0b0000_0010) != 0,
+            temp: (status & 0b0000_0100) != 0,
         })
     }
 
@@ -521,7 +516,6 @@ impl<'d, L, I1, I2> Lsm6dsv32<'d, L, I1, I2> {
             return None;
         }
         loop {
-            
             let status = match self.read_status_reg().await {
                 Ok(s) => s,
                 Err(e) => {
@@ -532,26 +526,21 @@ impl<'d, L, I1, I2> Lsm6dsv32<'d, L, I1, I2> {
 
             match mode {
                 LogicOp::AND => {
-                    if (!accel || status.accel_data_ready)
-                        && (!gyro || status.gyro_data_ready)
-                        && (!temp || status.temp_data_ready)
+                    if (!accel || status.accel) && (!gyro || status.gyro) && (!temp || status.temp)
                     {
                         return Some(ReadySRC {
-                            gyro: gyro && status.gyro_data_ready,
-                            accel: accel && status.accel_data_ready,
-                            temp: temp && status.temp_data_ready,
+                            gyro: gyro && status.gyro,
+                            accel: accel && status.accel,
+                            temp: temp && status.temp,
                         });
                     }
                 }
                 LogicOp::OR => {
-                    if (accel && status.accel_data_ready)
-                        || (gyro && status.gyro_data_ready)
-                        || (temp && status.temp_data_ready)
-                    {
+                    if (accel && status.accel) || (gyro && status.gyro) || (temp && status.temp) {
                         return Some(ReadySRC {
-                            gyro: gyro && status.gyro_data_ready,
-                            accel: accel && status.accel_data_ready,
-                            temp: temp && status.temp_data_ready,
+                            gyro: gyro && status.gyro,
+                            accel: accel && status.accel,
+                            temp: temp && status.temp,
                         });
                     }
                 }
@@ -573,8 +562,7 @@ impl<'d, L, I1, I2> Lsm6dsv32<'d, L, I1, I2> {
     ) -> Result<(), Error>
     where
         F: FnMut(ImuSample),
-    {   
-        
+    {
         let rdy = self
             .wait_for_data_ready_polling(accel, gyro, temp, mode, delay_us)
             .await;
@@ -620,6 +608,10 @@ impl<'d, L, I1, I2> Lsm6dsv32<'d, L, I1, I2> {
             error!("Error committing config: {:?}", e);
         }
     }
+
+    pub fn config_general(&mut self, config: GenerelConfig) {
+        self.config.general = config;
+    }
 }
 
 impl<'d, I1, I2> Lsm6dsv32<'d, FifoDisabled, I1, I2> {
@@ -636,43 +628,13 @@ impl<'d, I1, I2> Lsm6dsv32<'d, FifoDisabled, I1, I2> {
                 fifo: self.config.fifo,
                 int1: self.config.int1,
                 int2: self.config.int2,
+                high_accuracy_mode: self.config.high_accuracy_mode,
             },
         }
     }
 }
 
 impl<'d, I1, I2> Lsm6dsv32<'d, FifoEnabled, I1, I2> {
-    pub fn config_fifo(
-        &mut self,
-        mode: FIFOMode,
-        gyro: GyroBatchDataRate,
-        accel: AccelBatchDataRate,
-        temp: TempatureBatchRate,
-        ts: TimeStampBatch,
-    ) {
-        let config_old = &self.config.fifo;
-        self.config.fifo = FifoConfig {
-            mode,
-            gyro_fifo: gyro,
-            accel_fifo: accel,
-            temp_fifo: temp,
-            ts_fifo: ts,
-            watermark_threshold: config_old.watermark_threshold,
-            counter_trigger: config_old.counter_trigger,
-            counter_threshold: config_old.counter_threshold,
-            batch_dual: self.config.accel.dual_channel,
-        };
-    }
-    pub fn set_watermark_threshold(&mut self, threshold: u8) {
-        self.config.fifo.watermark_threshold = threshold;
-    }
-
-    pub fn set_counter(&mut self, trigger: TriggerCounter, threshold: u16) {
-        let th = threshold.min(1023);
-        self.config.fifo.counter_trigger = trigger;
-        self.config.fifo.counter_threshold = th;
-    }
-
     pub async fn read_fifo_status(&mut self) -> Result<FifoStatusSample, Error> {
         let fifo_status1 = self.read_register(Register::FIFO_STATUS1 as u8).await?;
         let fifo_status2 = self.read_register(Register::FIFO_STATUS2 as u8).await?;
@@ -795,7 +757,7 @@ impl<'d, I1, I2> Lsm6dsv32<'d, FifoEnabled, I1, I2> {
                                 i16::from_le_bytes([data[4], data[5]]) - self.hw.bias_accel_ch2[2],
                             ];
                             sampler.set_accel_ch2(raw);
-                        }else {
+                        } else {
                             continue;
                         }
                     }
@@ -851,110 +813,253 @@ impl<'d, I1, I2> Lsm6dsv32<'d, FifoEnabled, I1, I2> {
                 general: self.config.general,
                 accel: self.config.accel,
                 gyro: self.config.gyro,
-                fifo: ImuConfig::default().fifo,
+                fifo: FifoConfig::default(),
                 int1: self.config.int1,
                 int2: self.config.int2,
+                high_accuracy_mode: self.config.high_accuracy_mode,
             },
         }
     }
 }
 
-/*
-impl<I1,I2> ImuConfig<FifoDisabled, I1, I2> {
-    pub fn enable_fifo(self, fifo_config: FifoConfig) -> ImuConfig<FifoEnabled, I1, I2> {
-        ImuConfig {
-            fifo_state: FifoEnabled,
-            int1_state: self.int1_state,
-            int2_state: self.int2_state,
-            general: self.general,
-            accel: self.accel,
-            gyro: self.gyro,
-            fifo: fifo_config,
-            int1: self.int1,
-            int2: self.int2,
-        }
-    }
-
-}
-
-impl<I1,I2> ImuConfig<FifoEnabled, I1, I2> {
-    pub fn disable_fifo(self) -> ImuConfig<FifoDisabled, I1, I2> {
-        ImuConfig {
-            fifo_state: FifoDisabled,
-            int1_state: self.int1_state,
-            int2_state: self.int2_state,
-            general: self.general,
-            accel: self.accel,
-            gyro: self.gyro,
-            fifo: self.fifo,
-            int1: self.int1,
-            int2: self.int2,
+impl<'d, FI, I2> Lsm6dsv32<'d, FI, Int1Disabled, I2> {
+    pub fn enable_interrupt1(self) -> Lsm6dsv32<'d, FI, Int1Enabled, I2> {
+        Lsm6dsv32 {
+            hw: self.hw,
+            config: ImuConfig {
+                fifo_state: self.config.fifo_state,
+                int1_state: Int1Enabled,
+                int2_state: self.config.int2_state,
+                general: self.config.general,
+                accel: self.config.accel,
+                gyro: self.config.gyro,
+                fifo: self.config.fifo,
+                int1: self.config.int1,
+                int2: self.config.int2,
+                high_accuracy_mode: self.config.high_accuracy_mode,
+            },
         }
     }
 }
 
-impl<F,I2> ImuConfig<F,Int1Disabled, I2> {
-    pub fn enable_int1(self, int1_config: Interrupt1Config) -> ImuConfig<F, Int1Enabled, I2> {
-        ImuConfig {
-            fifo_state: self.fifo_state,
-            int1_state: Int1Enabled,
-            int2_state: self.int2_state,
-            general: self.general,
-            accel: self.accel,
-            gyro: self.gyro,
-            fifo: self.fifo,
-            int1: int1_config,
-            int2: self.int2,
+impl<'d, FI, I1> Lsm6dsv32<'d, FI, I1, Int2Disabled> {
+    pub fn enable_interrupt2(self) -> Lsm6dsv32<'d, FI, I1, Int2Enabled> {
+        Lsm6dsv32 {
+            hw: self.hw,
+            config: ImuConfig {
+                fifo_state: self.config.fifo_state,
+                int1_state: self.config.int1_state,
+                int2_state: Int2Enabled,
+                general: self.config.general,
+                accel: self.config.accel,
+                gyro: self.config.gyro,
+                fifo: self.config.fifo,
+                int1: self.config.int1,
+                int2: self.config.int2,
+                high_accuracy_mode: self.config.high_accuracy_mode,
+            },
         }
     }
 }
 
-impl<F,I2> ImuConfig<F,Int1Enabled, I2> {
-    pub fn disable_int1(self) -> ImuConfig<F, Int1Disabled, I2> {
-        ImuConfig {
-            fifo_state: self.fifo_state,
-            int1_state: Int1Disabled,
-            int2_state: self.int2_state,
-            general: self.general,
-            accel: self.accel,
-            gyro: self.gyro,
-            fifo: self.fifo,
-            int1: self.int1,
-            int2: self.int2,
+impl<'d, FI, I2> Lsm6dsv32<'d, FI, Int1Enabled, I2> {
+    pub async fn wait_for_data_ready_interrupt1(
+        &mut self,
+        accel: bool,
+        gyro: bool,
+        temp: bool,
+        mode: LogicOp,
+    ) -> Result<ReadySRC, Error> {
+        if !accel && !gyro && !temp {
+            error!("wait_for_data_ready called with no sensors selected");
+            return Err(Error::WrongConfig);
         }
+        if (accel && self.config.accel.odr == AccelODR::PowerDown)
+            || (gyro && self.config.gyro.odr == GyroODR::PowerDown)
+        {
+            error!("wait_for_data_ready called for powered down sensor");
+            return Err(Error::WrongConfig);
+        }
+        loop {
+            if self.config.general.interrupt_lvl == false {
+                self.hw.int1.wait_for_rising_edge().await;
+                if self.hw.debug_mode {
+                    debug!("Interrupt erkannt")
+                }
+            } else {
+                self.hw.int1.wait_for_falling_edge().await;
+                if self.hw.debug_mode {
+                    debug!("Interrupt erkannt")
+                }
+            }
+            let status = self.read_status_reg().await?;
+
+            match mode {
+                LogicOp::AND => {
+                    if (!accel || status.accel) && (!gyro || status.gyro) && (!temp || status.temp)
+                    {
+                        return Ok(ReadySRC {
+                            gyro: gyro && status.gyro,
+                            accel: accel && status.accel,
+                            temp: temp && status.temp,
+                        });
+                    }
+                }
+                LogicOp::OR => {
+                    if (accel && status.accel) || (gyro && status.gyro) || (temp && status.temp) {
+                        return Ok(ReadySRC {
+                            gyro: gyro && status.gyro,
+                            accel: accel && status.accel,
+                            temp: temp && status.temp,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn read_data_when_ready_interrupt1<F>(
+        &mut self,
+        accel: bool,
+        gyro: bool,
+        temp: bool,
+        ts: bool,
+        mode: LogicOp,
+        mut on_sample: F,
+    ) -> Result<(), Error>
+    where
+        F: FnMut(ImuSample),
+    {
+        let data_ready = self
+            .wait_for_data_ready_interrupt1(accel, gyro, temp, mode)
+            .await?;
+
+        let mut sample: ImuSample = Default::default();
+        if ts {
+            sample.last_ts = self.read_timestamp().await.unwrap_or(0) as u64;
+        }
+        if data_ready.accel
+            && self.config.accel.odr != AccelODR::PowerDown
+            && !self.config.accel.dual_channel
+        {
+            sample.accel = self.read_accel_raw().await?;
+        }
+        if data_ready.accel
+            && self.config.accel.odr != AccelODR::PowerDown
+            && self.config.accel.dual_channel
+        {
+            (sample.accel, sample.accel_ch2) = self.read_accel_dual_raw().await?;
+        }
+        if data_ready.gyro && self.config.gyro.odr != GyroODR::PowerDown {
+            sample.gyro = self.read_gyro_raw().await?;
+        }
+        if data_ready.temp && self.config.general.timestamp_enabled {
+            sample.temp = self.read_temp_raw().await?;
+        }
+        on_sample(sample);
+        Ok(())
     }
 }
 
-impl<F,I1> ImuConfig<F,I1,Int2Disabled> {
-    pub fn enable_int2(self, int2_config: Interrupt2Config) -> ImuConfig<F, I1, Int2Enabled> {
-        ImuConfig {
-            fifo_state: self.fifo_state,
-            int1_state: self.int1_state,
-            int2_state: Int2Enabled,
-            general: self.general,
-            accel: self.accel,
-            gyro: self.gyro,
-            fifo: self.fifo,
-            int1: self.int1,
-            int2: int2_config,
+
+impl<'d, FI, I1> Lsm6dsv32<'d, FI, I1, Int2Enabled> {
+    pub async fn wait_for_data_ready_interrupt2(
+        &mut self,
+        accel: bool,
+        gyro: bool,
+        temp: bool,
+        mode: LogicOp,
+    ) -> Result<ReadySRC, Error> {
+        if !accel && !gyro && !temp {
+            error!("wait_for_data_ready called with no sensors selected");
+            return Err(Error::WrongConfig);
         }
+        if (accel && self.config.accel.odr == AccelODR::PowerDown)
+            || (gyro && self.config.gyro.odr == GyroODR::PowerDown)
+        {
+            error!("wait_for_data_ready called for powered down sensor");
+            return Err(Error::WrongConfig);
+        }
+        loop {
+            if self.config.general.interrupt_lvl == false {
+                self.hw.int2.wait_for_rising_edge().await;
+                if self.hw.debug_mode {
+                    debug!("Interrupt erkannt")
+                }
+            } else {
+                self.hw.int2.wait_for_falling_edge().await;
+                if self.hw.debug_mode {
+                    debug!("Interrupt erkannt")
+                }
+            }
+            let status = self.read_status_reg().await?;
+
+            match mode {
+                LogicOp::AND => {
+                    if (!accel || status.accel) && (!gyro || status.gyro) && (!temp || status.temp)
+                    {
+                        return Ok(ReadySRC {
+                            gyro: gyro && status.gyro,
+                            accel: accel && status.accel,
+                            temp: temp && status.temp,
+                        });
+                    }
+                }
+                LogicOp::OR => {
+                    if (accel && status.accel) || (gyro && status.gyro) || (temp && status.temp) {
+                        return Ok(ReadySRC {
+                            gyro: gyro && status.gyro,
+                            accel: accel && status.accel,
+                            temp: temp && status.temp,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn read_data_when_ready_interrupt2<F>(
+        &mut self,
+        accel: bool,
+        gyro: bool,
+        temp: bool,
+        ts: bool,
+        mode: LogicOp,
+        mut on_sample: F,
+    ) -> Result<(), Error>
+    where
+        F: FnMut(ImuSample),
+    {
+        let data_ready = self
+            .wait_for_data_ready_interrupt2(accel, gyro, temp, mode)
+            .await?;
+
+        let mut sample: ImuSample = Default::default();
+        if ts {
+            sample.last_ts = self.read_timestamp().await.unwrap_or(0) as u64;
+        }
+        if data_ready.accel
+            && self.config.accel.odr != AccelODR::PowerDown
+            && !self.config.accel.dual_channel
+        {
+            sample.accel = self.read_accel_raw().await?;
+        }
+        if data_ready.accel
+            && self.config.accel.odr != AccelODR::PowerDown
+            && self.config.accel.dual_channel
+        {
+            (sample.accel, sample.accel_ch2) = self.read_accel_dual_raw().await?;
+        }
+        if data_ready.gyro && self.config.gyro.odr != GyroODR::PowerDown {
+            sample.gyro = self.read_gyro_raw().await?;
+        }
+        if data_ready.temp && self.config.general.timestamp_enabled {
+            sample.temp = self.read_temp_raw().await?;
+        }
+        on_sample(sample);
+        Ok(())
     }
 }
 
-impl<F,I1> ImuConfig<F,I1,Int2Enabled> {
-    pub fn disable_int2(self) -> ImuConfig<F, I1, Int2Disabled> {
-        ImuConfig {
-            fifo_state: self.fifo_state,
-            int1_state: self.int1_state,
-            int2_state: Int2Disabled,
-            general: self.general,
-            accel: self.accel,
-            gyro: self.gyro,
-            fifo: self.fifo,
-            int1: self.int1,
-            int2: self.int2,
-        }
-    }
-}
 
-*/
+

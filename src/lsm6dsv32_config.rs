@@ -3,6 +3,8 @@
 
 use core::{cmp::max, str};
 
+use defmt::error;
+
 #[macro_export]
 macro_rules! create_state_marker {
     (
@@ -23,6 +25,15 @@ create_state_marker!(
     Int2Disabled,
     Int2Enabled
 );
+type SpiError = embassy_stm32::spi::Error;
+
+#[derive(defmt::Format)]
+pub enum Error {
+    Spi(SpiError),
+    NoValue,
+    WrongWhoAmI(u8),
+    WrongConfig,
+}
 
 #[allow(non_camel_case_types)]
 #[repr(u8)]
@@ -57,18 +68,20 @@ pub enum Register {
     MD1_CFG = 0x5E,
     MD2_CFG = 0x5F,
     EMB_FUNC_CFG = 0x63,
+    HAODR_CFG = 0x62,
     FIFO_DATA_OUT_TAG = 0x78,
     FIFO_DATA_OUT_X_L = 0x79,
 }
 
 #[derive(Clone, Debug)]
 pub struct ImuConfigRaw {
-    pub general: GenerelConfig,
-    pub accel: AccelConfig,
-    pub gyro: GyroConfig,
-    pub fifo: FifoConfig,
-    pub int1: Interrupt1Config,
-    pub int2: Interrupt2Config,
+    pub(crate) general: GenerelConfig,
+    pub(crate) accel: AccelConfig,
+    pub(crate) gyro: GyroConfig,
+    pub(crate) fifo: FifoConfig,
+    pub(crate) int1: Interrupt1Config,
+    pub(crate) int2: Interrupt2Config,
+    pub(crate) high_accuracy_mode: Option<HighAccuracyODR>,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +95,14 @@ pub struct ImuConfig<Fifo, Int1, Int2> {
     pub fifo: FifoConfig,
     pub int1: Interrupt1Config,
     pub int2: Interrupt2Config,
+    pub high_accuracy_mode: Option<HighAccuracyODR>,
+}
+impl<F, I1, I2> ImuConfig<F, I1, I2> {
+    pub fn use_high_accuracy_mode(&mut self, haodr: HighAccuracyODR) {
+        self.high_accuracy_mode = Some(haodr);
+        self.accel.ha_mode = true;
+        self.gyro.ha_mode = true;
+    }
 }
 #[derive(Clone, Debug, Copy)]
 pub struct GenerelConfig {
@@ -92,42 +113,251 @@ pub struct GenerelConfig {
     pub interrupt_pin_mode: bool,
     pub timestamp_enabled: bool,
 }
+
+impl Default for GenerelConfig {
+    fn default() -> Self {
+        Self {
+            sda_pull_up: false,
+            sdo_pull_up: false,
+            anti_spike_filter: false,
+            interrupt_lvl: false,
+            interrupt_pin_mode: false,
+            timestamp_enabled: true,
+        }
+    }
+}
 #[derive(Clone, Debug, Copy)]
 pub struct GyroConfig {
-    pub enabled: bool,
-    pub mode: GyroOperatingMode,
-    pub odr: GyroODR,
-    pub lpf1_enabled: bool,
-    pub lpf1: GyroLpf1,
+    pub(crate) mode: GyroOperatingMode,
+    pub(crate) odr: GyroODR,
+    pub(crate) lpf1_enabled: bool,
+    pub(crate) lpf1: GyroLpf1,
     pub full_scale: GyroFS,
+    ha_mode:bool,
+}
+
+impl Default for GyroConfig {
+    fn default() -> Self {
+        Self {
+            mode: GyroOperatingMode::HighPerformance,
+            odr: GyroODR::PowerDown,
+            lpf1_enabled: false,
+            lpf1: GyroLpf1::Medium,
+            full_scale: GyroFS::DPS250,
+            ha_mode: false,
+        }
+    }
+}
+
+impl GyroConfig {
+    pub fn set_mode(&mut self, mode: GyroOperatingMode) -> Result<(), Error> {
+        if self.ha_mode && !(mode == GyroOperatingMode::HighAccuracy) {
+            return Err(Error::WrongConfig);
+        } else {
+            self.mode = mode;
+            Ok(())
+        }
+    }
+    pub fn set_odr(&mut self, odr: GyroODR) -> Result<(), Error> {
+        match self.mode {
+            GyroOperatingMode::HighPerformance => self.odr = odr,
+            GyroOperatingMode::HighAccuracy => {
+                if (odr as u8) >= (GyroODR::Hz15 as u8) {
+                    self.odr = odr;
+                } else {
+                    error!("HighAccuracyMode only available with an ODR above 15Hz");
+                    return Err(Error::WrongConfig);
+                }
+            }
+            GyroOperatingMode::LowPowerMode => {
+                if (odr as u8) <= (GyroODR::Hz240 as u8) {
+                    self.odr = odr;
+                } else {
+                    error!("LowPowerMode only available with an odr equal or less than 240Hz");
+                    return Err(Error::WrongConfig);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn activate_lpf1(&mut self, gyro_bw: GyroLpf1) -> Result<(), Error> {
+        if self.mode == GyroOperatingMode::HighPerformance {
+            self.lpf1_enabled = true;
+            self.lpf1 = gyro_bw;
+            Ok(())
+        } else {
+            error!("lpf1 only available in high-performance-mode");
+            return Err(Error::WrongConfig);
+        }
+    }
+
+    pub fn calc_scaling_factor(&self, unit_scale: UnitScale) -> f32 {
+        let fs_value: f32 = match self.full_scale {
+            GyroFS::DPS125 => 125.0,
+            GyroFS::DPS250 => 250.0,
+            GyroFS::DPS500 => 500.0,
+            GyroFS::DPS1000 => 1000.0,
+            GyroFS::DPS2000 => 2000.0,
+            GyroFS::DPS4000 => 4000.0,
+        };
+
+        (fs_value * unit_scale.as_f32()) / 32768.0
+    }
 }
 #[derive(Clone, Debug, Copy)]
 pub struct AccelConfig {
-    pub enabled: bool,
-    pub mode: AccelOperatingMode,
-    pub odr: AccelODR,
-    pub lp_hp_f2: AccelFilterBW,
+    pub(crate) mode: AccelOperatingMode,
+    pub(crate) odr: AccelODR,
+    pub(crate) lp_hp_f2: AccelFilterBW,
     pub full_scale: AccelFS,
-    pub lp_hp: bool,
-    pub lpf2_enabled: bool,
+    pub(crate) lp_hp: bool,
+    pub(crate) lpf2_enabled: bool,
     pub hp_reference_mode: bool,
-    pub user_offset_en: bool,
-    pub user_offset_weight: bool,
-    pub user_offset: [i8; 3],
+    pub(crate) user_offset_en: bool,
+    pub(crate) user_offset_weight: bool,
+    pub(crate) user_offset: [i8; 3],
     pub dual_channel: bool,
+    ha_mode: bool,
+}
+
+impl Default for AccelConfig {
+    fn default() -> Self {
+        Self {
+            mode: AccelOperatingMode::HighPerformance,
+            odr: AccelODR::PowerDown,
+            lp_hp_f2: AccelFilterBW::OdrDiv20,
+            full_scale: AccelFS::G8,
+            lp_hp: false,
+            lpf2_enabled: false,
+            hp_reference_mode: false,
+            user_offset_en: false,
+            user_offset_weight: false,
+            user_offset: [0i8; 3],
+            dual_channel: false,
+            ha_mode: false,
+        }
+    }
+}
+
+impl AccelConfig {
+    pub fn calc_scaling_factor(&self, unit_scale: UnitScale) -> f32 {
+        let fs_g = match self.full_scale {
+            AccelFS::G4 => 4.0,
+            AccelFS::G8 => 8.0,
+            AccelFS::G16 => 16.0,
+            AccelFS::G32 => 32.0,
+        };
+
+        (fs_g * unit_scale.as_f32()) / 32768.0
+    }
+
+    pub fn set_mode(&mut self, mode: AccelOperatingMode) -> Result<(), Error> {
+        if self.ha_mode && !(mode == AccelOperatingMode::HighAccuracy) {
+            return Err(Error::WrongConfig);
+        } else {
+            self.mode = mode;
+            Ok(())
+        }
+    }
+
+    pub fn set_odr(&mut self, odr: AccelODR) -> Result<(), Error> {
+        match self.mode {
+            AccelOperatingMode::HighPerformance => {
+                if (odr as u8) >= (AccelODR::Hz7_5 as u8) {
+                    self.odr = odr;
+                } else {
+                    error!("HighAccuracyMode only available with an ODR above 7.5Hz");
+                    return Err(Error::WrongConfig);
+                }
+            }
+            AccelOperatingMode::Normal => {
+                if (odr as u8) >= (AccelODR::Hz7_5 as u8)
+                    || (odr as u8) <= (AccelODR::KHz1_92 as u8)
+                {
+                    self.odr = odr;
+                } else {
+                    error!("NormalMode only available with an ODR between 7.5Hz and 1.92kHz");
+                    return Err(Error::WrongConfig);
+                }
+            }
+            AccelOperatingMode::HighAccuracy => {
+                if (odr as u8) >= (GyroODR::Hz15 as u8) {
+                    self.odr = odr;
+                } else {
+                    error!("HighAccuracyMode only available with an ODR above 15Hz");
+                    return Err(Error::WrongConfig);
+                }
+            }
+            AccelOperatingMode::LowPowerMode2Mean
+            | AccelOperatingMode::LowPowerMode4Mean
+            | AccelOperatingMode::LowPowerMode8Mean => {
+                if (odr as u8) <= (GyroODR::Hz240 as u8) {
+                    self.odr = odr;
+                } else {
+                    error!("LowPowerMode only available with an odr equal or less than 240Hz");
+                    return Err(Error::WrongConfig);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn activate_lpf2(&mut self, lpf2_bw: AccelFilterBW) {
+        self.lp_hp_f2 = lpf2_bw;
+        self.lpf2_enabled = true;
+        self.lp_hp = false;
+    }
+
+    pub fn activate_hp(&mut self, hp_bw: AccelFilterBW) {
+        self.lp_hp_f2 = hp_bw;
+        self.lpf2_enabled = false;
+        self.lp_hp = true;
+    }
 }
 #[derive(Clone, Debug, Copy)]
 pub struct FifoConfig {
     pub mode: FIFOMode,
     pub watermark_threshold: u8,
-    pub counter_threshold: u16,
-    pub counter_trigger: TriggerCounter,
+    pub(crate) counter_threshold: u16,
+    pub(crate) counter_trigger: TriggerCounter,
     pub gyro_fifo: GyroBatchDataRate,
     pub accel_fifo: AccelBatchDataRate,
     pub temp_fifo: TempatureBatchRate,
     pub ts_fifo: TimeStampBatch,
     pub batch_dual: bool,
 }
+
+impl Default for FifoConfig {
+    fn default() -> Self {
+        Self {
+            mode: FIFOMode::Bypass,
+            watermark_threshold: 0,
+            counter_threshold: 0,
+            counter_trigger: TriggerCounter::Accel,
+            gyro_fifo: GyroBatchDataRate::NotBatched,
+            accel_fifo: AccelBatchDataRate::NotBatched,
+            temp_fifo: TempatureBatchRate::NotBatched,
+            ts_fifo: TimeStampBatch::NotBatched,
+            batch_dual: false,
+        }
+    }
+}
+
+impl FifoConfig {
+    pub fn set_bdr(&mut self,gyro: GyroBatchDataRate, accel: AccelBatchDataRate, temp: TempatureBatchRate, ts: TimeStampBatch) {
+        self.gyro_fifo = gyro;
+        self.accel_fifo = accel;
+        self.temp_fifo = temp;
+        self.ts_fifo = ts;
+    }
+    pub fn set_counter(&mut self, trigger: TriggerCounter, threshold: u16) {
+        let th = threshold.min(1023);
+        self.counter_threshold = th;
+        self.counter_trigger = trigger;
+    }
+}
+
 #[derive(Clone, Debug, Copy)]
 pub struct Interrupt1Config {
     pub counter_bdr_int: bool,
@@ -147,48 +377,35 @@ pub struct Interrupt2Config {
     pub data_ready_accel: bool,
     pub temp_ready: bool,
 }
-impl AccelConfig {
-    pub fn calc_scaling_factor(&self, unit_scale: UnitScale) -> f32 {
-        let fs_g = match self.full_scale {
-            AccelFS::G4 => 4.0,
-            AccelFS::G8 => 8.0,
-            AccelFS::G16 => 16.0,
-            AccelFS::G32 => 32.0,
-        };
 
-        (fs_g * unit_scale.as_f32()) / 32768.0
-    }
-
-    pub fn get_fs(&self) -> i32 {
-        match self.full_scale {
-            AccelFS::G4 => 4,
-            AccelFS::G8 => 8,
-            AccelFS::G16 => 16,
-            AccelFS::G32 => 32,
-        }
-    }
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+#[repr(u8)]
+pub enum HighAccuracyODR {
+    Standard = 0,
+    ShiftedUp = 1,
+    ShiftedDown = 2,
 }
 
-impl GyroConfig {
-    pub fn calc_scaling_factor(&self, unit_scale: UnitScale) -> f32 {
-        let fs_value: f32 = match self.full_scale {
-            GyroFS::DPS125 => 125.0,
-            GyroFS::DPS250 => 250.0,
-            GyroFS::DPS500 => 500.0,
-            GyroFS::DPS1000 => 1000.0,
-            GyroFS::DPS2000 => 2000.0,
-            GyroFS::DPS4000 => 4000.0,
-        };
-
-        (fs_value * unit_scale.as_f32()) / 32768.0
-    }
-}
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 #[repr(u32)]
 pub enum UnitScale {
     Micro = 1_000_000,
     Milli = 1_000,
     Default = 1,
+}
+
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+#[repr(u8)]
+pub enum ActivationLevel {
+    ActiveHigh = 0,
+    ActiveLow = 1,
+}
+
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+#[repr(u8)]
+pub enum IntMode {
+    PushPull = 0,
+    OpenDrain = 1,
 }
 
 impl UnitScale {
@@ -242,7 +459,6 @@ pub enum GyroFS {
 pub enum GyroOperatingMode {
     HighPerformance,
     HighAccuracy,
-    ODRTriggered,
     LowPowerMode,
 }
 
@@ -326,7 +542,6 @@ pub enum AccelFS {
 pub enum AccelOperatingMode {
     HighPerformance = 0b000,
     HighAccuracy = 0b001,
-    ODRTriggered = 0b011,
     // takes mean value of x samples
     LowPowerMode2Mean = 0b100,
     LowPowerMode4Mean = 0b101,
@@ -409,11 +624,7 @@ pub enum TriggerCounter {
     Gyro = 0b01,
 }
 
-pub struct StatusRegSample {
-    pub accel_data_ready: bool,
-    pub gyro_data_ready: bool,
-    pub temp_data_ready: bool,
-}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
 
 pub struct FifoStatusSample {
@@ -628,47 +839,10 @@ impl Default for ImuConfig<FifoDisabled, Int1Disabled, Int2Disabled> {
             fifo_state: FifoDisabled,
             int1_state: Int1Disabled,
             int2_state: Int2Disabled,
-            general: GenerelConfig {
-                sda_pull_up: false,
-                sdo_pull_up: false,
-                anti_spike_filter: false,
-                interrupt_lvl: false,
-                interrupt_pin_mode: false,
-                timestamp_enabled: true,
-            },
-            accel: AccelConfig {
-                enabled: true,
-                mode: AccelOperatingMode::HighPerformance,
-                odr: AccelODR::Hz1_875,
-                lp_hp_f2: AccelFilterBW::OdrDiv4,
-                full_scale: AccelFS::G8,
-                lp_hp: false,
-                lpf2_enabled: false,
-                hp_reference_mode: false,
-                user_offset_en: false,
-                user_offset_weight: false,
-                user_offset: [0; 3],
-                dual_channel: true,
-            },
-            gyro: GyroConfig {
-                enabled: true,
-                mode: GyroOperatingMode::HighPerformance,
-                odr: GyroODR::PowerDown,
-                lpf1_enabled: false,
-                lpf1: GyroLpf1::ExtraWide,
-                full_scale: GyroFS::DPS125,
-            },
-            fifo: FifoConfig {
-                mode: FIFOMode::Bypass,
-                watermark_threshold: 0,
-                counter_threshold: 0,
-                counter_trigger: TriggerCounter::Accel,
-                gyro_fifo: GyroBatchDataRate::NotBatched,
-                accel_fifo: AccelBatchDataRate::NotBatched,
-                temp_fifo: TempatureBatchRate::NotBatched,
-                ts_fifo: TimeStampBatch::NotBatched,
-                batch_dual: false,
-            },
+            general: GenerelConfig::default(),
+            accel: AccelConfig::default(),
+            gyro: GyroConfig::default(),
+            fifo: FifoConfig::default(),
             int1: Interrupt1Config {
                 counter_bdr_int: false,
                 fifo_full_int: false,
@@ -686,6 +860,7 @@ impl Default for ImuConfig<FifoDisabled, Int1Disabled, Int2Disabled> {
                 data_ready_accel: false,
                 temp_ready: false,
             },
+            high_accuracy_mode: None,
         }
     }
 }
@@ -699,6 +874,7 @@ impl<Fi, I1, I2> ImuConfig<Fi, I1, I2> {
             fifo: self.fifo,
             int1: self.int1,
             int2: self.int2,
+            high_accuracy_mode: self.high_accuracy_mode,
         }
     }
 }
