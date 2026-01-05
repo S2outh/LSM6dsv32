@@ -588,7 +588,6 @@ dependencies = [
  "lsm6dsv32",
  "nb 1.1.0",
  "panic-probe",
- "portable-atomic",
  "static_cell",
 ]
 

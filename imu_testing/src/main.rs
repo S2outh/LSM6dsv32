@@ -6,16 +6,7 @@ use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::{Spawner, task};
 use embassy_stm32::{
-    Peri, bind_interrupts,
-    exti::ExtiInput,
-    gpio::{Level, Output, Pull, Speed},
-    interrupt,
-    mode::Async,
-    pac::usb::vals::Stat,
-    peripherals,
-    spi::{Config, Instance, Mode, Phase, Polarity, Spi},
-    time::Hertz,
-    usart::{self, Config as UartConfig, Uart},
+    Peri, bind_interrupts, Config, exti::ExtiInput, gpio::{Level, Output, Pull, Speed}, interrupt, mode::Async, rcc, peripherals, spi::{self, Instance, Mode, Phase, Polarity, Spi}, time::Hertz, usart::{self, Config as UartConfig, Uart}
 };
 use embassy_time::Timer;
 use panic_probe as _;
@@ -23,12 +14,30 @@ use static_cell::StaticCell;
 
 type SpiError = embassy_stm32::spi::Error;
 
+fn get_rcc_config() -> rcc::Config {
+    let mut rcc_config = rcc::Config::default();
+    rcc_config.hsi = Some(rcc::HSIPrescaler::DIV1);
+    rcc_config.sys = rcc::Sysclk::HSI;
+    rcc_config.pll1 = Some(rcc::Pll {
+        source: rcc::PllSource::HSI,
+        prediv: rcc::PllPreDiv::DIV8,
+        mul: rcc::PllMul::MUL40,
+        divp: None,
+        divq: Some(rcc::PllDiv::DIV10),
+        divr: Some(rcc::PllDiv::DIV5),
+    });
+    rcc_config.mux.fdcansel = rcc::mux::Fdcansel::PLL1_Q;
+    rcc_config
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    let p = embassy_stm32::init(Default::default());
+    let mut config = Config::default();
+    config.rcc = get_rcc_config();
+    let p = embassy_stm32::init(config);
     info!("Programm gestartet");
 
-    let mut spi_config = Config::default();
+    let mut spi_config = spi::Config::default();
     spi_config.frequency = Hertz(500_000);
     // CPOL = takt im Ruhezustand (0-> Idle = LOW; 1 -> Idle = HIGH)
     // CPHA = an welcher Flanke werden die Daten gelesen (0-> erste Flanke )
@@ -61,9 +70,6 @@ async fn main(spawner: Spawner) {
 
     let mut lsm = lsm.enable_fifo().enable_interrupt1();
 
-    loop {
-        lsm.wait_for_data_ready_interrupt1().await;
-    }
      /*
     loop {
            

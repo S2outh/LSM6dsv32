@@ -1,5 +1,5 @@
-[target.thumbv6m-none-eabi]
-runner = "probe-rs run --chip STM32G0B1RE "
+[target.thumbv7em-none-eabihf]
+runner = "probe-rs run --chip STM32H723vg "
 rustflags = [
   "-C", "link-arg=-Tlink.x", # linker file
   "-C", "link-arg=--nmagic", # no std memory layout
@@ -7,7 +7,7 @@ rustflags = [
 ]
 
 [build]
-target = "thumbv6m-none-eabi"
+target = "thumbv7em-none-eabihf"
 
 [env]
 DEFMT_LOG = "trace"
