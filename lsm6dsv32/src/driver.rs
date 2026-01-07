@@ -8,6 +8,7 @@ use embassy_stm32::{
     spi::Spi,
 };
 use embassy_time::Timer;
+use embassy_sync::{mutex::Mutex, blocking_mutex::raw::ThreadModeRawMutex};
 
 pub const EXPECTED_WHO_AM_I: u8 = 0x70;
 pub const G32_SCALE_FACTOR: f32 = 32.0 / 32768.0;
@@ -33,12 +34,15 @@ macro_rules! encode_reg8 {
     };
 }
 
-// ======================================================
-// Converts raw sensor data to f32 physical units using desired scaling factor
+
+/// Converts raw temp data to f32 °C
 pub fn temp_f32(raw: i16) -> f32 {
     (raw as f32 / 256.0) + 25.0
 }
-
+/// Converts raw accel data to f32 physical unit using scaling factor
+/// ```rust
+/// let mut s = 10;
+/// ```
 pub fn accel_f32(scale: f32, raw: [i16; 3]) -> [f32; 3] {
     [
         (raw[0] as f32) * scale,
@@ -74,11 +78,10 @@ pub fn gyro_f32(scale: f32, raw: [i16; 3]) -> [f32; 3] {
 
 /// Hardware layer containing peripherals and calibration offset
 pub struct Lsm6dsv32HW<'d> {
-    spi: &'d mut Spi<'d, Async>,
-    cs: &'d mut Output<'d>,
-    int1: &'d mut ExtiInput<'d>,
-    int2: &'d mut ExtiInput<'d>,
-    debug_mode: bool,
+    spi: &'d Mutex<ThreadModeRawMutex, Spi<'d, Async>>,
+    cs: Output<'d>,
+    int1: ExtiInput<'d>,
+    int2: ExtiInput<'d>,
     bias_accel: [i16; 3],
     bias_accel_ch2: [i16; 3],
     bias_gyro: [i16; 3],
@@ -93,11 +96,10 @@ pub struct Lsm6dsv32<'d, F, I1, I2> {
 
 impl<'d> Lsm6dsv32<'d, FifoDisabled, Int1Disabled, Int2Disabled> {
     pub async fn new(
-        spi: &'d mut Spi<'d, Async>,
-        cs: &'d mut Output<'d>,
-        int1: &'d mut ExtiInput<'d>,
-        int2: &'d mut ExtiInput<'d>,
-        debug: bool,
+        spi: &'d Mutex<ThreadModeRawMutex, Spi<'d, Async>>,
+        cs: Output<'d>,
+        int1: ExtiInput<'d>,
+        int2: ExtiInput<'d>,
     ) -> Self {
         let imu_config = ImuConfig::default();
 
@@ -106,7 +108,6 @@ impl<'d> Lsm6dsv32<'d, FifoDisabled, Int1Disabled, Int2Disabled> {
             cs,
             int1,
             int2,
-            debug_mode: debug,
             bias_accel: [0; 3],
             bias_gyro: [0; 3],
             bias_accel_ch2: [0; 3],
@@ -123,9 +124,6 @@ impl<'d> Lsm6dsv32<'d, FifoDisabled, Int1Disabled, Int2Disabled> {
 }
 
 impl<'d, L, I1, I2> Lsm6dsv32<'d, L, I1, I2> {
-    pub fn enable_debug(&mut self, enable: bool) {
-        self.hw.debug_mode = enable;
-    }
 
     async fn set_config(&mut self, imu_config: ImuConfigRaw) {
         if let Err(e) = self.write_config_registers(&imu_config).await {
@@ -149,18 +147,16 @@ impl<'d, L, I1, I2> Lsm6dsv32<'d, L, I1, I2> {
     }
 
     async fn write_config_registers(&mut self, imu_config: &ImuConfigRaw) -> Result<(), Error> {
-        let debug = self.hw.debug_mode;
 
         macro_rules! log_reg {
             ($name:expr, $val:expr) => {
-                if debug {
-                    defmt::debug!("{}: {:08b}", $name, $val);
-                }
+                #[cfg(feature = "debug")]
+                debug!("{}: {:08b}", $name, $val);
+                
             };
             ($name:expr, $old:expr, $new:expr) => {
-                if debug {
-                    defmt::debug!("{} old: {:08b}, new: {:08b}", $name, $old, $new);
-                }
+                #[cfg(feature = "debug")]
+                debug!("{} old: {:08b}, new: {:08b}", $name, $old, $new);
             };
         }
 
@@ -343,9 +339,8 @@ impl<'d, L, I1, I2> Lsm6dsv32<'d, L, I1, I2> {
 
         let mut buffer = [cmd, val];
         self.hw.cs.set_low();
-        self.hw
-            .spi
-            .transfer_in_place(&mut buffer)
+        let mut spi = self.hw.spi.lock().await;
+        spi.transfer_in_place(&mut buffer)
             .await
             .map_err(|e| Error::Spi(e))?;
         self.hw.cs.set_high();
@@ -360,9 +355,9 @@ impl<'d, L, I1, I2> Lsm6dsv32<'d, L, I1, I2> {
         let mut buffer = [cmd, 0x00];
 
         self.hw.cs.set_low();
-        self.hw
-            .spi
-            .transfer_in_place(&mut buffer)
+        let mut spi = self.hw.spi.lock().await;
+    
+        spi.transfer_in_place(&mut buffer)
             .await
             .map_err(|e| Error::Spi(e))?;
         self.hw.cs.set_high();
@@ -383,9 +378,8 @@ impl<'d, L, I1, I2> Lsm6dsv32<'d, L, I1, I2> {
         buffer[0] = cmd;
 
         self.hw.cs.set_low();
-        self.hw
-            .spi
-            .transfer_in_place(&mut buffer[..n])
+        let mut spi = self.hw.spi.lock().await;
+        spi.transfer_in_place(&mut buffer[..n])
             .await
             .map_err(Error::Spi)?;
         self.hw.cs.set_high();
@@ -643,9 +637,8 @@ impl<'d, I1, I2> Lsm6dsv32<'d, FifoEnabled, I1, I2> {
                     return;
                 }
             };
-            if self.hw.debug_mode {
-                debug!("{:?}", status);
-            }
+            #[cfg(feature = "debug")]
+            debug!("{:?}", status);
             match trigger {
                 FifoTrigger::Counter => {
                     if self.config.fifo.counter_threshold == 0 {
@@ -694,8 +687,6 @@ impl<'d, I1, I2> Lsm6dsv32<'d, FifoEnabled, I1, I2> {
             self.config.fifo.gyro_fifo,
         );
         self.fifo_wait_for_polling(trigger, delay_us).await;
-        debug!("triggered");
-        let mut counter = 0;
         loop {
             let status = self.read_fifo_status().await?;
             let num_samples = status.unread_samples;
@@ -704,7 +695,6 @@ impl<'d, I1, I2> Lsm6dsv32<'d, FifoEnabled, I1, I2> {
                 return Ok(());
             }
 
-            debug!("num: {}", num_samples);
             let mut raw_buffer = [0u8; 210];
 
             self.read_fifo_burst(&mut raw_buffer).await?;
@@ -755,7 +745,6 @@ impl<'d, I1, I2> Lsm6dsv32<'d, FifoEnabled, I1, I2> {
                         }
                     }
                     0x00 => {
-                        debug!("counter: {}", counter);
                         return Ok(());
                     } // FIFO leer
                     _ => {
@@ -764,7 +753,6 @@ impl<'d, I1, I2> Lsm6dsv32<'d, FifoEnabled, I1, I2> {
                 }
                 if let Some(sample) = sampler.complete_sample() {
                     on_sample(sample);
-                    counter += 1;
                 }
             }
         }
@@ -777,18 +765,15 @@ impl<'d, I1, I2> Lsm6dsv32<'d, FifoEnabled, I1, I2> {
 
         self.hw.cs.set_low();
         let mut cmd_buf = [cmd];
-        self.hw
-            .spi
-            .transfer_in_place(&mut cmd_buf)
+        let mut spi = self.hw.spi.lock().await;
+        spi.transfer_in_place(&mut cmd_buf)
             .await
             .map_err(Error::Spi)?;
 
         for byte in data.iter_mut() {
             *byte = 0;
         }
-        self.hw
-            .spi
-            .transfer_in_place(data)
+        spi.transfer_in_place(data)
             .await
             .map_err(Error::Spi)?;
 
@@ -876,14 +861,14 @@ impl<'d, FI, I2> Lsm6dsv32<'d, FI, Int1Enabled, I2> {
         loop {
             if self.config.general.interrupt_lvl == false {
                 self.hw.int1.wait_for_rising_edge().await;
-                if self.hw.debug_mode {
-                    debug!("Interrupt erkannt")
-                }
+                #[cfg(feature = "debug")]
+                debug!("Interrupt erkannt")
+                
             } else {
                 self.hw.int1.wait_for_falling_edge().await;
-                if self.hw.debug_mode {
-                    debug!("Interrupt erkannt")
-                }
+                #[cfg(feature = "debug")]
+                debug!("Interrupt erkannt")
+                
             }
             let status = self.read_status_reg().await?;
 
@@ -976,14 +961,12 @@ impl<'d, FI, I1> Lsm6dsv32<'d, FI, I1, Int2Enabled> {
         loop {
             if self.config.general.interrupt_lvl == false {
                 self.hw.int2.wait_for_rising_edge().await;
-                if self.hw.debug_mode {
-                    debug!("Interrupt erkannt")
-                }
+                #[cfg(feature = "debug")]
+                debug!("Interrupt erkannt")
             } else {
                 self.hw.int2.wait_for_falling_edge().await;
-                if self.hw.debug_mode {
-                    debug!("Interrupt erkannt")
-                }
+                #[cfg(feature = "debug")]
+                debug!("Interrupt erkannt")
             }
             let status = self.read_status_reg().await?;
 

@@ -6,8 +6,9 @@ use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::{Spawner, task};
 use embassy_stm32::{
-    Peri, bind_interrupts, Config, exti::ExtiInput, gpio::{Level, Output, Pull, Speed}, interrupt, mode::Async, rcc, peripherals, spi::{self, Instance, Mode, Phase, Polarity, Spi}, time::Hertz, usart::{self, Config as UartConfig, Uart}
+    Peri, bind_interrupts, Config, exti::ExtiInput, gpio::{Level, Output, Pull, Speed}, interrupt, mode::Async, rcc, peripherals, spi::{self, Instance, Mode, Phase, Polarity, Spi}, time::Hertz
 };
+use embassy_sync::{mutex::Mutex, blocking_mutex::raw::ThreadModeRawMutex};
 use embassy_time::Timer;
 use panic_probe as _;
 use static_cell::StaticCell;
@@ -46,22 +47,23 @@ async fn main(spawner: Spawner) {
         phase: Phase::CaptureOnFirstTransition, // CPHA=0
     }; // => SPI Mode 0
 
-    static SPI: StaticCell<Spi<'static, Async>> = StaticCell::new();
-    static CS: StaticCell<Output<'static>> = StaticCell::new();
-    static INT1: StaticCell<ExtiInput<'static>> = StaticCell::new();
-    static INT2: StaticCell<ExtiInput<'static>> = StaticCell::new();
+    static SPI: StaticCell<Mutex<ThreadModeRawMutex,Spi<'static, Async>>> = StaticCell::new();
 
-    let spi = SPI.init(Spi::new(
+    let mut spi = Spi::new(
         p.SPI1, p.PA5, p.PA7, p.PA6, p.DMA2_CH3, p.DMA2_CH2, spi_config,
-    ));
+    );
 
-    let cs = CS.init(Output::new(p.PB0, Level::High, Speed::High));
+    let spi_mutex = Mutex::new(spi);
 
-    let int1 = INT1.init(ExtiInput::new(p.PA9, p.EXTI9, Pull::Down));
+    let spi = SPI.init(spi_mutex);
 
-    let int2 = INT2.init(ExtiInput::new(p.PA8, p.EXTI8, Pull::Down));
+    let cs =  Output::new(p.PB1, Level::High, Speed::High);
 
-    let mut lsm = Lsm6dsv32::new(spi, cs, int1, int2, true).await;
+    let int1 =ExtiInput::new(p.PA9, p.EXTI9, Pull::Down);
+
+    let int2 = ExtiInput::new(p.PA8, p.EXTI8, Pull::Down);
+
+    let mut lsm = Lsm6dsv32::new(spi, cs, int1, int2).await;
     lsm.commit_config().await;
 
     let scale = lsm.calc_scaling(UnitScale::Default);

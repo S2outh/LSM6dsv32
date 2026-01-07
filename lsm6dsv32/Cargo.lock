@@ -160,16 +160,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "defmt-rtt"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93d5a25c99d89c40f5676bec8cefe0614f17f0f40e916f98e345dae941807f9e"
-dependencies = [
- "critical-section",
- "defmt 1.0.1",
-]
-
-[[package]]
 name = "document-features"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -471,10 +461,9 @@ name = "lsm6dsv32"
 version = "0.1.0"
 dependencies = [
  "defmt 1.0.1",
- "defmt-rtt",
  "embassy-stm32",
+ "embassy-sync",
  "embassy-time",
- "embedded-hal 0.2.7",
 ]
 
 [[package]]
