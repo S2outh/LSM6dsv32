@@ -83,7 +83,7 @@ impl<'d, L, I1, I2> Lsm6dsv32<'d, L, I1, I2> {
     }
     /// Converts raw gyro data to f32 rad/s
     pub fn gyro_f32(&self, raw: [i16; 3]) -> [f32; 3] {
-        raw.map(|val| val as f32 * self.config.gyro.calc_scaling_factor())
+        raw.map(|val| val as f32 * self.config.gyro.calc_scaling_factor(true))
     }
     /// Converts dual-channel raw acceleration data to f32 m/s².
     ///
@@ -95,14 +95,14 @@ impl<'d, L, I1, I2> Lsm6dsv32<'d, L, I1, I2> {
         let raw1 = raw.0;
         let raw2 = raw.1;
         (
-            raw1.map(|val| val as f32 * self.config.accel.calc_scaling_factor()),
-            raw2.map(|val| val as f32 * self.config.accel.calc_scaling_factor_ch2()),
+            raw1.map(|val| val as f32 * self.config.accel.calc_scaling_factor(true)),
+            raw2.map(|val| val as f32 * self.config.accel.calc_scaling_factor_ch2(true)),
         )
     }
 
     /// Converts raw acceleration data to f32 m/s²
     pub fn accel_f32(&self, raw: [i16; 3]) -> [f32; 3] {
-        raw.map(|val| val as f32 * self.config.accel.calc_scaling_factor())
+        raw.map(|val| val as f32 * self.config.accel.calc_scaling_factor(true))
     }
 
     /// Converts a raw IMU sample into SI units using f32
@@ -110,17 +110,87 @@ impl<'d, L, I1, I2> Lsm6dsv32<'d, L, I1, I2> {
         ImuSampleF32 {
             accel: raw_sample
                 .accel
-                .map(|val| val as f32 * self.config.accel.calc_scaling_factor()),
+                .map(|val| val as f32 * self.config.accel.calc_scaling_factor(true)),
             accel_ch2: raw_sample
                 .accel_ch2
-                .map(|val| val as f32 * self.config.accel.calc_scaling_factor_ch2()),
+                .map(|val| val as f32 * self.config.accel.calc_scaling_factor_ch2(true)),
             gyro: raw_sample
                 .gyro
-                .map(|val| val as f32 * self.config.gyro.calc_scaling_factor()),
+                .map(|val| val as f32 * self.config.gyro.calc_scaling_factor(true)),
             temp: (raw_sample.temp as f32 / 256.0) + 25.0,
             last_ts: raw_sample.last_ts,
             delta_ts: raw_sample.delta_ts,
         }
+    }
+    /// Coordinates the full stationary calibration for all enabled sensor channels (Z-Axis facing up)
+    /// 
+    /// Logged Output data can also be hardcoded later using [`set_hardware_offsets`](Self::set_hardware_offsets)
+    pub async fn calibrate(&mut self) -> Result<(),Error> {
+        info!("Starting calibration...");
+        self.calibrate_accel().await?;
+        info!("Accel-Bias: {:?}", self.hw.bias_accel);
+        if self.config.accel.dual_channel {info!("Accel-Bias channel 2: {:?}", self.hw.bias_accel_ch2);}
+
+        self.calibrate_gyro().await?;
+        info!("Gyro-Bias: {:?}", self.hw.bias_gyro);
+        Ok(())
+    }
+    /// Manually sets pre-calculated hardware bias offsets bypassing the calibration via [`calibrate`](Self::calibrate)
+    pub fn set_hardware_offsets(&mut self, accel: [i16;3], accel_ch2: [i16;3], gyro: [i16;3]) {
+        self.hw.bias_accel = accel;
+        self.hw.bias_accel_ch2 = accel_ch2;
+        self.hw.bias_gyro = gyro;
+    }
+
+    async fn calibrate_accel(&mut self) -> Result<(), Error> {
+        let samples = 2000.0;
+        let mut sum: [i32; 3] = [0; 3];
+        let mut sum_ch2: [i32; 3] = [0; 3];
+
+        for _ in 0..samples as i16 {
+            let raw_data = self.read_accel_dual_raw().await?;
+            sum[0] += raw_data.0[0] as i32;
+            sum[1] += raw_data.0[1] as i32;
+            sum[2] += raw_data.0[2] as i32;
+
+            if self.config.accel.dual_channel {
+                sum_ch2[0] += raw_data.1[0] as i32;
+                sum_ch2[1] += raw_data.1[1] as i32;
+                sum_ch2[2] += raw_data.1[2] as i32;
+            }
+            Timer::after_millis(2).await;
+        }
+        self.hw.bias_accel[0] = (sum[0] as f32 / samples) as i16;
+        self.hw.bias_accel[1] = (sum[1] as f32 / samples) as i16;
+        self.hw.bias_accel[2] =
+            (sum[2] as f32 / samples - 1.0 / self.config.accel.calc_scaling_factor(false)) as i16;
+
+        if self.config.accel.dual_channel {
+            self.hw.bias_accel_ch2[0] = (sum_ch2[0] as f32 / samples) as i16;
+            self.hw.bias_accel_ch2[1] = (sum_ch2[1] as f32 / samples) as i16;
+            self.hw.bias_accel_ch2[2] = (sum_ch2[2] as f32 / samples
+                - 1.0 / self.config.accel.calc_scaling_factor_ch2(false))
+                as i16;
+        }
+        Ok(())
+    }
+
+    async fn calibrate_gyro(&mut self) -> Result<(), Error> {
+        let samples = 2000.0;
+        let mut sum: [i32; 3] = [0; 3];
+
+        for _ in 0..samples as i16 {
+            let raw_data = self.read_gyro_raw().await?;
+            sum[0] += raw_data[0] as i32;
+            sum[1] += raw_data[1] as i32;
+            sum[2] += raw_data[2] as i32;
+            Timer::after_millis(2).await;
+        }
+        self.hw.bias_gyro[0] = (sum[0] as f32 / samples) as i16;
+        self.hw.bias_gyro[1] = (sum[1] as f32 / samples) as i16;
+        self.hw.bias_gyro[2] = (sum[2] as f32 / samples) as i16;
+
+        Ok(())
     }
 
     async fn set_config(&mut self, imu_config: ImuConfigRaw) {

@@ -238,7 +238,7 @@ impl GyroConfig {
         }
     }
     /// Calculates the scaling factor to convert raw `i16` to radians per second (rad/s)
-    pub fn calc_scaling_factor(&self) -> f32 {
+    pub fn calc_scaling_factor(&self, in_rads: bool) -> f32 {
         let fs_value: f32 = match self.full_scale {
             GyroFS::DPS125 => 125.0,
             GyroFS::DPS250 => 250.0,
@@ -247,8 +247,13 @@ impl GyroConfig {
             GyroFS::DPS2000 => 2000.0,
             GyroFS::DPS4000 => 4000.0,
         };
-
-        (fs_value / 32768.0) * (PI / 180.0)
+        let factor = fs_value / 32768.0 ;
+        if in_rads {
+            factor *  (PI / 180.0)
+        } else {
+            factor
+        }
+        
     }
 }
 
@@ -294,8 +299,8 @@ impl Default for AccelConfig {
 }
 
 impl AccelConfig {
-    /// Calculates the scaling factor to convert raw `i16` to m/s^2
-    pub fn calc_scaling_factor(&self) -> f32 {
+    /// Calculates the scaling factor to convert raw `i16` to g or m/s^2
+    pub fn calc_scaling_factor(&self, in_mps2: bool) -> f32 {
         let fs_g = match self.full_scale {
             AccelFS::G4 => 4.0,
             AccelFS::G8 => 8.0,
@@ -303,12 +308,22 @@ impl AccelConfig {
             AccelFS::G32 => 32.0,
         };
 
-        fs_g / 32768.0 * 9.80665
+        let factor = fs_g / 32768.0;
+        if in_mps2 {
+            factor * 9.80665
+        }else {
+            factor
+        }
     }
 
-    /// Calculates the scaling factor for second channel to convert raw `i16` to m/s^2
-    pub fn calc_scaling_factor_ch2(&self) -> f32 {
-        32.0 / 32768.0 * 9.80665
+    /// Calculates the scaling factor for second channel to convert raw `i16` to g or m/s^2
+    pub fn calc_scaling_factor_ch2(&self, in_mps2: bool) -> f32 {
+        let factor = 32.0 / 32768.0 ;
+        if in_mps2 {
+            factor * 9.80665
+        }else {
+            factor
+        }
     }
     /// Sets accel operating mode
     /// - available when High AccuracyMode is not active
