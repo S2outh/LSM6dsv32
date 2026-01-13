@@ -64,9 +64,13 @@ async fn main(spawner: Spawner) {
     let int2 = ExtiInput::new(p.PA8, p.EXTI8, Pull::Down);
 
     let mut lsm = Lsm6dsv32::new(spi, cs, int1, int2).await;
-    lsm.commit_config().await;
+    lsm.config.use_high_accuracy_mode(HighAccuracyODR::Standard);   
+    lsm.config.accel.dual_channel = true;
+    let _ = lsm.config.accel.set_odr(AccelODR::KHz1_92);
+    lsm.config.accel.full_scale = AccelFS::G8;
+    lsm.config.gyro.full_scale = GyroFS::DPS500;
 
-    let scale = lsm.calc_scaling(UnitScale::Default);
+    lsm.commit_config().await;
 
     spawner.spawn(send_iterupt(p.PB5)).unwrap();
 

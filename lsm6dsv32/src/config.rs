@@ -112,6 +112,8 @@ impl<F, I1, I2> ImuConfig<F, I1, I2> {
         self.high_accuracy_mode = Some(haodr);
         self.accel.ha_mode = true;
         self.gyro.ha_mode = true;
+        self.accel.mode = AccelOperatingMode::HighAccuracy;
+        self.gyro.mode = GyroOperatingMode::HighAccuracy;
     }
 
     /// Builds [`ImuConfigRaw`] stripping type-state information
