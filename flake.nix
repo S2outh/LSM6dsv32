@@ -21,6 +21,7 @@
       {
         devShells.default =
         let
+          rust-analyzer = pkgs.fenix.rust-analyzer;
           toolchain = pkgs.fenix.toolchainOf {
             channel = "nightly";
             date = "2025-12-22";
@@ -49,6 +50,8 @@
         pkgs.mkShell {
           buildInputs = with pkgs; [
             rust
+            rust-analyzer
+            cargo-edit
 
             # for flashing
             probe-rs-tools

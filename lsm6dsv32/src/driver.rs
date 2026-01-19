@@ -1,7 +1,7 @@
 pub use crate::config::*;
 
 use defmt::*;
-use embassy_stm32::{exti::ExtiInput, gpio::Output, mode::Async, spi::Spi};
+use embassy_stm32::{exti::ExtiInput, gpio::Output, mode::Async, spi::{Spi, mode::Master}};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::Timer;
@@ -31,7 +31,7 @@ macro_rules! encode_reg8 {
 
 /// Hardware layer containing peripherals and calibration offset
 pub struct Lsm6dsv32HW<'d> {
-    spi: &'d Mutex<ThreadModeRawMutex, Spi<'d, Async>>,
+    spi: &'d Mutex<ThreadModeRawMutex, Spi<'d, Async, Master>>,
     cs: Output<'d>,
     int1: ExtiInput<'d>,
     int2: ExtiInput<'d>,
@@ -49,7 +49,7 @@ pub struct Lsm6dsv32<'d, F, I1, I2> {
 
 impl<'d> Lsm6dsv32<'d, FifoDisabled, Int1Disabled, Int2Disabled> {
     pub async fn new(
-        spi: &'d Mutex<ThreadModeRawMutex, Spi<'d, Async>>,
+        spi: &'d Mutex<ThreadModeRawMutex, Spi<'d, Async, Master>>,
         cs: Output<'d>,
         int1: ExtiInput<'d>,
         int2: ExtiInput<'d>,
@@ -406,7 +406,7 @@ impl<'d, L, I1, I2> Lsm6dsv32<'d, L, I1, I2> {
         let mut buffer = [cmd, val];
         self.hw.cs.set_low();
         let mut spi = self.hw.spi.lock().await;
-        let spi: &mut Spi<'_, Async> = &mut spi;
+        let spi: &mut Spi<'_, Async, Master> = &mut spi;
         spi.transfer_in_place(&mut buffer)
             .await
             .map_err(|e| Error::Spi(e))?;
@@ -423,7 +423,7 @@ impl<'d, L, I1, I2> Lsm6dsv32<'d, L, I1, I2> {
 
         self.hw.cs.set_low();
         let mut spi = self.hw.spi.lock().await;
-        let spi: &mut Spi<'_, Async> = &mut spi;
+        let spi: &mut Spi<'_, Async, Master> = &mut spi;
 
         spi.transfer_in_place(&mut buffer)
             .await
@@ -447,7 +447,7 @@ impl<'d, L, I1, I2> Lsm6dsv32<'d, L, I1, I2> {
 
         self.hw.cs.set_low();
         let mut spi = self.hw.spi.lock().await;
-        let spi: &mut Spi<'_, Async> = &mut spi;
+        let spi: &mut Spi<'_, Async, Master> = &mut spi;
         spi.transfer_in_place(&mut buffer[..n])
             .await
             .map_err(Error::Spi)?;
@@ -914,7 +914,7 @@ impl<'d, I1, I2> Lsm6dsv32<'d, FifoEnabled, I1, I2> {
         self.hw.cs.set_low();
         let mut cmd_buf = [cmd];
         let mut spi = self.hw.spi.lock().await;
-        let spi: &mut Spi<'_, Async> = &mut spi;
+        let spi: &mut Spi<'_, Async, Master> = &mut spi;
         spi.transfer_in_place(&mut cmd_buf)
             .await
             .map_err(Error::Spi)?;

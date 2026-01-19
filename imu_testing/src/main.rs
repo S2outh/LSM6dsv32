@@ -6,14 +6,16 @@ use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::{Spawner, task};
 use embassy_stm32::{
-    Peri, bind_interrupts, Config, exti::ExtiInput, gpio::{Level, Output, Pull, Speed}, interrupt, mode::Async, rcc, peripherals, spi::{self, Instance, Mode, Phase, Polarity, Spi}, time::Hertz
+    Config, Peri, bind_interrupts, exti::{self, ExtiInput}, gpio::{Level, Output, Pull, Speed}, interrupt::{typelevel::EXTI9_5}, mode::Async, peripherals, rcc, spi::{self, Mode, Phase, Polarity, Spi, mode::Master as Spi_Master}, time::Hertz
 };
 use embassy_sync::{mutex::Mutex, blocking_mutex::raw::ThreadModeRawMutex};
 use embassy_time::Timer;
 use panic_probe as _;
 use static_cell::StaticCell;
 
-type SpiError = embassy_stm32::spi::Error;
+bind_interrupts!(struct Irqs {
+    EXTI9_5 => exti::InterruptHandler<EXTI9_5>;
+});
 
 fn get_rcc_config() -> rcc::Config {
     let mut rcc_config = rcc::Config::default();
@@ -47,9 +49,9 @@ async fn main(spawner: Spawner) {
         phase: Phase::CaptureOnFirstTransition, // CPHA=0
     }; // => SPI Mode 0
 
-    static SPI: StaticCell<Mutex<ThreadModeRawMutex,Spi<'static, Async>>> = StaticCell::new();
+    static SPI: StaticCell<Mutex<ThreadModeRawMutex,Spi<'static, Async, Spi_Master>>> = StaticCell::new();
 
-    let mut spi = Spi::new(
+    let spi = Spi::new(
         p.SPI1, p.PA5, p.PA7, p.PA6, p.DMA2_CH3, p.DMA2_CH2, spi_config,
     );
 
@@ -59,9 +61,9 @@ async fn main(spawner: Spawner) {
 
     let cs =  Output::new(p.PB1, Level::High, Speed::High);
 
-    let int1 =ExtiInput::new(p.PA9, p.EXTI9, Pull::Down);
+    let int1 =ExtiInput::new(p.PA9, p.EXTI9, Pull::Down, Irqs);
 
-    let int2 = ExtiInput::new(p.PA8, p.EXTI8, Pull::Down);
+    let int2 = ExtiInput::new(p.PA8, p.EXTI8, Pull::Down, Irqs);
 
     let mut lsm = Lsm6dsv32::new(spi, cs, int1, int2).await;
     lsm.config.use_high_accuracy_mode(HighAccuracyODR::Standard);   
@@ -73,8 +75,6 @@ async fn main(spawner: Spawner) {
     lsm.commit_config().await;
 
     spawner.spawn(send_iterupt(p.PB5)).unwrap();
-
-    let mut lsm = lsm.enable_fifo().enable_interrupt1();
 
      /*
     loop {
